@@ -9,19 +9,21 @@ Differs from the other features:
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import streamlit as st
 
-from src.core import chunking, loaders, retrievers, vectordb
-from src.core.config import CHROMA_ROOT, DATA_DIR, UPLOAD_CHROMA_ROOT
-from src.core.loaders import sanitize_for_collection, save_uploaded_file
+from src.core import chunking, retrievers, ui, vectordb
+from src.core.config import DATA_DIR
 from src.features import FeatureSpec
 from src.features.contract_risk.pipeline import build_chain
 
 
 KB_FOLDER = DATA_DIR / "Contract_Risk"
 KB_COLLECTION = "contract_risk"
+KB_CSV_PATH = KB_FOLDER / "legal_contract_clauses.csv"
 
 
 SPEC = FeatureSpec(
@@ -36,6 +38,12 @@ SPEC = FeatureSpec(
         "Identify risky clauses against a curated risk knowledge base. "
         "Optionally upload your own contract to cross-reference."
     ),
+    suggestions=[
+        "Which limitation of liability clauses are high risk?",
+        "What makes an indemnification clause risky?",
+        "Flag the riskiest clauses in my uploaded contract.",
+        "How should I negotiate an auto-renewal clause?",
+    ],
 )
 
 
@@ -48,8 +56,8 @@ _CHAT_KEY = "contract_risk__chat"
 # KB loader (always cached for the session)
 # ---------------------------------------------------------------------------
 
-def _load_kb_documents() -> List:
-    """Load every file in the KB folder as Documents (PDF + CSV supported)."""
+def _kb_files() -> List:
+    """Every file in the KB folder (PDF + CSV + TXT)."""
     if not KB_FOLDER.exists():
         raise FileNotFoundError(
             f"Knowledge base folder missing: {KB_FOLDER}"
@@ -61,19 +69,18 @@ def _load_kb_documents() -> List:
     )
     if not files:
         raise ValueError(f"No KB files found in {KB_FOLDER}")
+    return files
 
-    docs = loaders.load_files_dispatch(files)
-    # Tag each doc with the source type so the LLM can tell pdf clauses
-    # from csv risk-matrix rows.
-    for d in docs:
-        suffix = (
-            d.metadata.get("source_path", "").lower().rsplit(".", 1)[-1]
-            if d.metadata.get("source_path")
-            else ""
-        )
-        d.metadata.setdefault("source_type", suffix or "unknown")
-        d.metadata.setdefault("category", "risk_kb")
-    return docs
+
+def _tag_kb_document(d) -> None:
+    """Tag the source type so the LLM can tell pdf clauses from csv risk-matrix rows."""
+    suffix = (
+        d.metadata.get("source_path", "").lower().rsplit(".", 1)[-1]
+        if d.metadata.get("source_path")
+        else ""
+    )
+    d.metadata.setdefault("source_type", suffix or "unknown")
+    d.metadata.setdefault("category", "risk_kb")
 
 
 def _get_or_build_kb() -> Dict[str, Any]:
@@ -83,22 +90,15 @@ def _get_or_build_kb() -> Dict[str, Any]:
 
     with st.status("Loading risk knowledge base...", expanded=True) as status:
         try:
-            status.update(label="Loading PDF + CSV...")
-            docs = _load_kb_documents()
-            st.write(f"Loaded {len(docs)} KB documents.")
-
-            status.update(label="Chunking...")
-            chunks = chunking.split_documents(
-                docs, chunk_size=1000, chunk_overlap=200,
-                separators=["\n\n", "\n", ".", ";"],
-            )
-            st.write(f"Created {len(chunks)} KB chunks.")
-
-            status.update(label="Building / loading vector store...")
-            vdb = vectordb.get_or_create_vectordb(
-                chunks=chunks,
-                persist_path=CHROMA_ROOT,
-                collection_name=KB_COLLECTION,
+            vdb, chunks = vectordb.index_files(
+                KB_COLLECTION,
+                _kb_files(),
+                lambda docs: chunking.split_documents(
+                    docs, chunk_size=1000, chunk_overlap=200,
+                    separators=["\n\n", "\n", ".", ";"],
+                ),
+                prepare=_tag_kb_document,
+                on_progress=st.write,
             )
 
             status.update(label="Building hybrid retriever...")
@@ -128,27 +128,18 @@ def _get_or_build_contract(uploaded_file) -> Dict[str, Any]:
     if bundle and bundle.get("filename") == uploaded_file.name:
         return bundle
 
-    upload_dir = KB_FOLDER / "uploaded_contracts"
-    saved_path = save_uploaded_file(uploaded_file, upload_dir)
-    sanitized = sanitize_for_collection(saved_path.name)
-    persist_path = UPLOAD_CHROMA_ROOT / sanitized
-    collection_name = f"upload_{sanitized}"
+    stored, collection_name = ui.save_upload(SPEC.key, uploaded_file)
+    saved_path = stored.local_path
 
     with st.status(f"Indexing {saved_path.name}...", expanded=True) as status:
         try:
-            status.update(label="Loading file...")
-            docs = loaders.load_files_dispatch([saved_path])
-            for d in docs:
-                d.metadata.setdefault("category", "user_contract")
-
-            status.update(label="Chunking...")
-            chunks = chunking.split_documents(docs)
-
-            status.update(label="Building / loading vector store...")
-            vdb = vectordb.get_or_create_vectordb(
-                chunks=chunks,
-                persist_path=persist_path,
-                collection_name=collection_name,
+            st.write(f"Stored in Blob Storage: `{stored.blob_name}`")
+            vdb, chunks = vectordb.index_files(
+                collection_name,
+                [saved_path],
+                chunking.split_documents,
+                prepare=lambda d: d.metadata.setdefault("category", "user_contract"),
+                on_progress=st.write,
             )
 
             status.update(label="Building hybrid retriever...")
@@ -171,35 +162,99 @@ def _get_or_build_contract(uploaded_file) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Browse risky clauses (CSV explorer)
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def _load_clauses_dataframe() -> pd.DataFrame:
+    """Load the curated clause risk matrix from disk."""
+    if not KB_CSV_PATH.exists():
+        raise FileNotFoundError(f"Clause CSV missing: {KB_CSV_PATH}")
+    df = pd.read_csv(KB_CSV_PATH)
+    expected = {"clause_text", "clause_type", "risk_level"}
+    missing = expected - set(df.columns)
+    if missing:
+        raise ValueError(f"Clause CSV missing columns: {sorted(missing)}")
+    df = df.dropna(subset=["clause_text"]).copy()
+    df["risk_level"] = df["risk_level"].astype(str).str.strip().str.lower()
+    df["clause_type"] = df["clause_type"].astype(str).str.strip()
+    return df
+
+
+def _render_clause_browser() -> None:
+    """Filterable table over the risky-clause knowledge base CSV."""
+    with st.expander("Browse risky clauses", expanded=False):
+        try:
+            df = _load_clauses_dataframe()
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Could not load clause browser: {exc}")
+            return
+
+        st.caption(
+            f"{len(df):,} clauses in `{KB_CSV_PATH.name}`. "
+            "Filter below to inspect the knowledge base without asking the LLM."
+        )
+
+        levels = sorted(df["risk_level"].dropna().unique().tolist())
+        types = sorted(df["clause_type"].dropna().unique().tolist())
+
+        col_level, col_type, col_search = st.columns([1, 2, 2])
+        with col_level:
+            selected_levels = st.multiselect(
+                "Risk level",
+                options=levels,
+                default=["high"] if "high" in levels else levels[:1],
+                key="contract_risk__browse_levels",
+            )
+        with col_type:
+            selected_types = st.multiselect(
+                "Clause type",
+                options=types,
+                default=[],
+                key="contract_risk__browse_types",
+                help="Leave empty to include all clause types.",
+            )
+        with col_search:
+            text_query = st.text_input(
+                "Search clause text",
+                value="",
+                key="contract_risk__browse_search",
+                placeholder="e.g. uncapped liability",
+            )
+
+        filtered = df
+        if selected_levels:
+            filtered = filtered[filtered["risk_level"].isin(selected_levels)]
+        if selected_types:
+            filtered = filtered[filtered["clause_type"].isin(selected_types)]
+        if text_query.strip():
+            needle = text_query.strip().lower()
+            filtered = filtered[
+                filtered["clause_text"].astype(str).str.lower().str.contains(
+                    needle, na=False, regex=False
+                )
+            ]
+
+        st.caption(f"Showing {len(filtered):,} of {len(df):,} clauses.")
+        st.dataframe(
+            filtered[["risk_level", "clause_type", "clause_text"]],
+            width="stretch",
+            hide_index=True,
+            height=320,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Chat
 # ---------------------------------------------------------------------------
 
 def _render_chat(kb_retriever, contract_retriever) -> None:
-    history: List[Dict[str, str]] = st.session_state.setdefault(_CHAT_KEY, [])
-
-    for msg in history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    question = st.chat_input("Ask about contract risks...")
-    if not question:
-        return
-
-    history.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    with st.chat_message("assistant"):
-        try:
-            with st.spinner("Analysing risks..."):
-                response = build_chain(kb_retriever, contract_retriever).invoke(
-                    {"question": question}
-                )
-            answer = getattr(response, "content", str(response))
-        except Exception as exc:  # noqa: BLE001
-            answer = f"Error: {exc}"
-        st.markdown(answer)
-        history.append({"role": "assistant", "content": answer})
+    ui.chat(
+        SPEC,
+        _CHAT_KEY,
+        lambda: build_chain(kb_retriever, contract_retriever),
+        placeholder="Ask about contract risks...",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,13 +262,12 @@ def _render_chat(kb_retriever, contract_retriever) -> None:
 # ---------------------------------------------------------------------------
 
 def render() -> None:
-    st.title(SPEC.title)
-    st.caption(SPEC.description)
+    ui.page_header(SPEC)
+    ui.new_chat_button(_CHAT_KEY)
 
     # Sidebar: optional contract upload (KB is always loaded automatically)
-    st.sidebar.markdown(f"### {SPEC.title}")
-    st.sidebar.caption(SPEC.description)
-    st.sidebar.markdown("**Risk knowledge base:** always loaded automatically.")
+    st.sidebar.markdown("**Documents**")
+    st.sidebar.caption("The risk knowledge base is always loaded automatically.")
 
     uploaded = st.sidebar.file_uploader(
         "Optionally upload your own contract",
@@ -248,21 +302,18 @@ def render() -> None:
         st.session_state.pop(_CONTRACT_KEY, None)
 
     if contract_bundle:
-        st.success(
-            f"Active sources: **risk KB** ({len(kb_bundle['chunks'])} chunks) "
-            f"+ **your contract** `{contract_bundle['filename']}` "
-            f"({len(contract_bundle['chunks'])} chunks)."
-        )
         st.caption(
-            "Questions are answered using BOTH sources. The LLM will "
-            "cross-reference your clauses against the KB."
+            f"Sources: risk KB ({len(kb_bundle['chunks'])} chunks) + "
+            f"`{contract_bundle['filename']}` ({len(contract_bundle['chunks'])} chunks). "
+            "Your clauses are cross-referenced against the KB."
         )
     else:
-        st.info(
-            f"Active source: **risk KB only** "
-            f"({len(kb_bundle['chunks'])} chunks). "
-            f"Upload a contract from the sidebar to add it as a second source."
+        st.caption(
+            f"Source: risk KB only ({len(kb_bundle['chunks'])} chunks). "
+            "Upload a contract from the sidebar to cross-reference it."
         )
+
+    _render_clause_browser()
 
     contract_retriever = contract_bundle["retriever"] if contract_bundle else None
     _render_chat(kb_bundle["retriever"], contract_retriever)

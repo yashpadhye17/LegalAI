@@ -1,36 +1,45 @@
-# Environment & secrets
 .env
-*.env
-
-# Python cache
-__pycache__/
-*.py[cod]
-*.pyo
-.pytest_cache/
-
-# Virtual environments
-venv/
-.venv/
-env/
-
-# Vector store & ChromaDB (generated at runtime)
+.env.local
 chromadb/
 .chromadb/
 vector_store/
+migration/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
 
-# Uploaded / user data files
-data/*/uploads/
-data/**/*.pdf
-data/**/*.csv
-data/**/*.txt
+.imgscan.*.tar
+*.log
 
-# Jupyter
-.ipynb_checkpoints/
+# Local-only slide artifacts. Keep docs/index.html and docs/.nojekyll for GitHub Pages.
+docs/_preview/
+docs/Milestone3_Legal_AI.pptx
+docs/Milestone3_*.docx
+docs/Milestone3_*.pdf
+docs/submission/
+docs/MILESTONE3_*.md
 
-# macOS
-.DS_Store
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+terraform/crash.log
+terraform/tfplan.bin
+terraform/plan*.txt
+terraform/apply*.txt
+terraform/init_out.txt
+acr_build.txt
 
-# IDE
-.idea/
-.vscode/
-*.swp
+# Local Node build deps / generators for submission decks
+submission/node_modules/
+submission/package.json
+submission/package-lock.json
+submission/build_m*.js
+submission/build_m*.py

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import re
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -81,8 +82,53 @@ def load_txts_from_folder(
 
 
 def load_csv(path: Path) -> List[Document]:
-    """Load a CSV with one Document per row."""
-    return _attach_metadata(CSVLoader(file_path=str(path)).load(), path)
+    """
+    Load a CSV with one Document per row.
+
+    We first try LangChain's CSVLoader, then fall back to a tolerant parser
+    when messy quoting/newlines cause parser errors. The fallback skips empty
+    rows and normalizes each row into a key-value text block.
+    """
+    try:
+        return _attach_metadata(CSVLoader(file_path=str(path)).load(), path)
+    except Exception:
+        pass
+
+    parse_errors: List[str] = []
+    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            docs: List[Document] = []
+            with open(path, "r", encoding=encoding, errors="replace", newline="") as fh:
+                reader = csv.DictReader(fh)
+                if not reader.fieldnames:
+                    raise ValueError("CSV has no header row.")
+
+                for row_number, row in enumerate(reader, start=2):
+                    if not row:
+                        continue
+
+                    parts = []
+                    for key, value in row.items():
+                        k = (key or "").strip()
+                        v = (value or "").strip()
+                        if k and v:
+                            parts.append(f"{k}: {v}")
+                    if not parts:
+                        continue
+
+                    docs.append(
+                        Document(
+                            page_content="\n".join(parts),
+                            metadata={"row_number": row_number},
+                        )
+                    )
+            return _attach_metadata(docs, path)
+        except Exception as exc:  # noqa: BLE001
+            parse_errors.append(f"{encoding}: {exc}")
+
+    raise ValueError(
+        f"Error loading {path}. Parser attempts failed: {' | '.join(parse_errors)}"
+    )
 
 
 def load_files_dispatch(paths: List[Path]) -> List[Document]:
@@ -116,24 +162,7 @@ _SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
 
 def sanitize_for_collection(name: str) -> str:
-    """
-    Make an arbitrary filename safe to use in a Chroma collection name
-    and as a directory component.
-    """
+    """Make an arbitrary filename safe to use in a collection name."""
     stem = Path(name).stem
     cleaned = _SANITIZE_RE.sub("_", stem).strip("_").lower()
     return cleaned or "upload"
-
-
-def save_uploaded_file(uploaded_file, destination_folder: Path) -> Path:
-    """
-    Persist a Streamlit ``UploadedFile`` to disk and return the saved Path.
-
-    Streamlit is intentionally not imported here so this module stays usable
-    outside the app; ``uploaded_file`` only needs ``.name`` and ``.getbuffer()``.
-    """
-    destination_folder.mkdir(parents=True, exist_ok=True)
-    target = destination_folder / uploaded_file.name
-    with open(target, "wb") as fh:
-        fh.write(uploaded_file.getbuffer())
-    return target

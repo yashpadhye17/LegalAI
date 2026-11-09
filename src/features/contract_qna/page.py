@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import streamlit as st
 
-from src.core import chunking, loaders, retrievers, ui, vectordb
+from src.core import chunking, retrievers, ui, vectordb
 from src.core.config import DATA_DIR
 from src.core.schemas import DataSource
 from src.features import FeatureSpec
@@ -25,6 +25,12 @@ SPEC = FeatureSpec(
         "Question & answer over contract text files. Answers are organised "
         "into Rights, Obligations, Risks, and Exceptions."
     ),
+    suggestions=[
+        "What are the termination rights of each party?",
+        "Summarise the renewal terms and notice periods.",
+        "What are the payment obligations and deadlines?",
+        "Are there any exclusivity or non-compete clauses?",
+    ],
 )
 
 
@@ -39,25 +45,17 @@ def _get_or_build_retriever(source: DataSource) -> Dict[str, Any]:
     if bundle and bundle.get("signature") == sig:
         return bundle
 
-    with st.status("Indexing contracts...", expanded=False) as status:
-        status.update(label="Loading text files...")
-        docs = loaders.load_files_dispatch(source.files)
-        st.write(f"Loaded {len(docs)} documents from {len(source.files)} file(s).")
-
-        status.update(label="Splitting into chunks...")
-        chunks = chunking.split_documents(
-            docs,
-            chunk_size=1000,
-            chunk_overlap=150,
-            separators=["\n\n", "\n", ".", " "],
-        )
-        st.write(f"Created {len(chunks)} chunks.")
-
-        status.update(label="Building / loading vector store...")
-        vdb = vectordb.get_or_create_vectordb(
-            chunks=chunks,
-            persist_path=source.persist_path,
-            collection_name=source.collection_name,
+    with st.status("Loading contracts from the database...", expanded=False) as status:
+        vdb, chunks = vectordb.index_files(
+            source.collection_name,
+            source.files,
+            lambda docs: chunking.split_documents(
+                docs,
+                chunk_size=1000,
+                chunk_overlap=150,
+                separators=["\n\n", "\n", ".", " "],
+            ),
+            on_progress=st.write,
         )
 
         status.update(label="Building hybrid retriever...")
@@ -80,53 +78,19 @@ def _get_or_build_retriever(source: DataSource) -> Dict[str, Any]:
     return bundle
 
 
-def _render_chat(retriever) -> None:
-    history: List[Dict[str, str]] = st.session_state.setdefault(_CHAT_KEY, [])
-
-    for msg in history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    question = st.chat_input("Ask about the contract(s)...")
-    if not question:
-        return
-
-    history.append({"role": "user", "content": question})
-    with st.chat_message("user"):
-        st.markdown(question)
-
-    with st.chat_message("assistant"):
-        try:
-            with st.spinner("Analysing..."):
-                response = build_qna_chain(retriever).invoke({"question": question})
-            answer = getattr(response, "content", str(response))
-        except Exception as exc:  # noqa: BLE001
-            answer = f"Error: {exc}"
-        st.markdown(answer)
-        history.append({"role": "assistant", "content": answer})
-
-
 def render() -> None:
-    st.title(SPEC.title)
-    st.caption(SPEC.description)
+    ui.page_header(SPEC)
+    ui.new_chat_button(_CHAT_KEY)
 
     source = ui.source_picker(SPEC)
     if source is None:
-        st.info(
-            "Choose **Use existing documents** or upload a contract `.txt` "
-            "from the sidebar to get started."
-        )
-        return
-    if not source.files:
-        st.warning("No files selected. Pick at least one from the sidebar.")
+        st.info("Upload a contract `.txt` from the sidebar to get started.")
         return
 
-    st.markdown(f"**Active source:** {source.label}")
-    with st.expander("Files in scope", expanded=False):
-        for f in source.files[:50]:
-            st.markdown(f"- `{f.name}`")
-        if len(source.files) > 50:
-            st.caption(f"... and {len(source.files) - 50} more.")
-
-    bundle = _get_or_build_retriever(source)
-    _render_chat(bundle["retriever"])
+    retriever = _get_or_build_retriever(source)["retriever"]
+    ui.chat(
+        SPEC,
+        _CHAT_KEY,
+        lambda: build_qna_chain(retriever),
+        placeholder="Ask about the contract(s)...",
+    )

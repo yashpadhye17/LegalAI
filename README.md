@@ -2,8 +2,6 @@
 
 A production-ready, multi-feature AI legal assistant built with **Streamlit**, **LangChain**, **PostgreSQL + pgvector**, and **Groq**. It provides a unified, navigable UI for six distinct legal document analysis pipelines, all sharing a clean layered architecture.
 
-> **Milestone 4: the app container is stateless.** Vectors and upload records live in Azure Database for PostgreSQL (private IP only), uploaded files in Blob Storage, and every secret in Key Vault. The container reaches all three with the VM's user-assigned managed identity, so there is no `.env` file and no key in the code or image. See [Deployment on Azure](#deployment-on-azure-milestone-4). The deep dive below still describes the Milestone 3 ChromaDB internals in places; `src/core/vectordb.py` is now a pgvector-backed LangChain `VectorStore` with the same retriever interface.
-
 ---
 
 ## Table of Contents
